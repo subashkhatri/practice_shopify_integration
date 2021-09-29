@@ -1,0 +1,134 @@
+# frozen_string_literal: true
+# require "graphql/client"
+# require "graphql/client/http"
+
+# Created a background job for generating csv
+class GenerateCsvJob < ApplicationJob
+  queue_as :default
+
+  def perform
+    ShopifyAPI::Base.activate_session(session)
+    orders = fetch_data
+    generate_csv(orders)
+  end
+
+  def fetch_data
+    orders = ShopifyAPI::Order.find(:all, params: { status: 'any', limit: 250 })
+    filtered_order = []
+    orders.each do |order|
+      last_paid_transaction_date, total_refund_amount,
+       vendor_name, order_risk = fetch_from_order(order)
+      filtered_order << {
+        name: check_for_data_availability(order.name),
+        email: check_for_data_availability(order.email),
+        financial_status: check_for_data_availability(order.financial_status),
+        paid_at: check_for_data_availability(last_paid_transaction_date),
+        fulfillment_status: check_for_data_availability(order.fulfillment_status),
+        currency: check_for_data_availability(order.currency),
+        price_subtotal: check_for_data_availability(order.subtotal_price),
+        price_total: check_for_data_availability(order.total_price),
+        billing_street: check_for_nil_billing_address(order, 'address1'),
+        billing_address1: check_for_nil_billing_address(order, 'address2'),
+        shipping_zip: check_for_nil_shipping_address(order, 'zip'),
+        shipping_country: check_for_nil_shipping_address(order, 'country'),
+        refunded_amount: check_for_data_availability(total_refund_amount),
+        vendor: vendor_name,
+        tags: check_for_data_availability(order.tags),
+        risk_level: check_for_data_availability(order_risk)
+      }
+    end
+    filtered_order
+  end
+
+  def check_for_data_availability(data)
+    return data if data.present?
+
+    'N/A'
+  end
+
+  def check_for_nil_billing_address(order, method_name)
+    unless order.billing_address?.nil?
+      return order.billing_address.send(method_name)
+    end
+
+    'N/A'
+  end
+
+  def check_for_nil_shipping_address(order, method_name)
+    unless order.shipping_address?.nil?
+      return order.shipping_address.send(method_name)
+    end
+
+    'N/A'
+  end
+
+  def fetch_from_order(order)
+    transactions = ShopifyAPI::Transaction.where({ order_id: order.id })
+    last_paid_transaction_date = ''
+    total_refund_amount = 0.0
+    vendor_name = []
+
+    unless transactions.empty? || transactions.nil?
+
+      transactions.each do |transaction|
+        if transaction.kind == 'sale' && transaction.status == 'success'
+          last_paid_transaction_date = transaction.created_at
+        end
+        if transaction.kind == 'refund' && transaction.status == 'success'
+          total_refund_amount += transaction.amount.to_f
+        end
+      end
+
+    end
+
+    order.line_items.each do |line_item|
+      vendor_name << ShopifyAPI::Product.find(line_item.product_id).vendor
+    end
+
+    order_risk = ShopifyAPI::OrderRisk.where({ order_id: order.id })
+
+    [last_paid_transaction_date, total_refund_amount, vendor_name, order_risk]
+  end
+
+  def generate_csv(orders)
+    headers = %w[
+      name
+      email
+      financial_status
+      paid_at
+      fulfillment_status
+      currency
+      price_subtotal
+      price_total
+      billing_street
+      billing_address1
+      shipping_zip
+      shipping_country
+      refunded_amount
+      vendor
+      tags
+      risk_level
+    ]
+
+    CSV.generate(headers: true) do |csv|
+      csv << headers
+
+      orders.each do |order|
+        csv << order.values
+      end
+    end
+  end
+
+  private
+
+  def session
+    @session ||= ShopifyAPI::Session.new(domain: "#{ENV['SHOP_NAME']}.myshopify.com",
+                                         token: ENV['SHOP_TOKEN'],
+                                         api_version: ENV['API_VERSION'])
+  end
+
+end
+#     "Name","Email","Financial Status","Paid at",
+# "Fulfillment Status","Currency","Price Subtotal",
+# "Price Total","Billing Street","Billing Address1",
+# "Shipping Zip","Shipping Country","Refunded Amount", "Vendor","Tags","Risk Level"
